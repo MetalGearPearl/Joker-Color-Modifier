@@ -1,16 +1,14 @@
 //! Adds extra color frames to the battle HUD's Joker color animations.
 //!
-//! `jack_bg` (portrait backdrop) and `jack_guage_color` (rebellion gauge) only have frames
-//! 0 = P5 red, 1 = P3 blue, 2 = P4 yellow. For each extra configured color we append one
-//! stepped frame: jack_bg gets the color itself, jack_guage_color repeats its non-P5 frame.
-//! The patched bflans are appended at the end of the SARC (layout.arc) and the file table
-//! is pointed at them, so nothing else in the archive moves.
+//! `jack_bg` (gauge outline and portrait backdrop) only has frames 0 = P5 red, 1 = P3 blue,
+//! 2 = P4 yellow. For each extra configured color we append one stepped frame with that
+//! color. The patched bflan is appended at the end of the SARC (layout.arc) and the file
+//! table is pointed at it, so nothing else in the archive moves.
 
 use std::convert::TryInto;
 
 pub const HUD_LAYOUT: &str = "ui/layout/info/info_melee/info_melee/layout.arc";
 const JACK_BG: &str = "anim/p2_info_melee_lct_jack_jack_bg.bflan";
-const JACK_GAUGE_COLOR: &str = "anim/p2_info_melee_lct_jack_jack_guage_color.bflan";
 
 fn u16_at(d: &[u8], o: usize) -> usize {
     u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as usize
@@ -163,11 +161,6 @@ fn append_frames(contents: &mut Vec<Content>, values: impl Fn(u8, &[[f32; 3]]) -
     last as u16
 }
 
-/// Value a stepped target holds from `frame` on (the last key at that frame).
-fn value_at(keys: &[[f32; 3]], frame: f32) -> f32 {
-    keys.iter().filter(|k| k[0] <= frame).last().map(|k| k[1]).unwrap_or(0.0)
-}
-
 struct Sarc<'a> {
     data: &'a [u8],
     data_offset: usize,
@@ -211,49 +204,34 @@ impl<'a> Sarc<'a> {
 }
 
 /// Patches the HUD layout archive held in `buffer[..size]` in place, appending the rebuilt
-/// animations after it. Returns the new size, or None when the archive does not look like
+/// animation after it. Returns the new size, or None when the archive does not look like
 /// the expected one or does not fit (then the buffer is left untouched).
 pub fn patch_layout_in_place(buffer: &mut [u8], size: usize, extra_colors: &[[f32; 3]]) -> Option<usize> {
-    let (bg_node, bg, gauge_node, gauge, data_offset) = {
+    let (node, file, data_offset) = {
         let arc = &buffer[..size];
         let sarc = Sarc::parse(arc)?;
-        let (bg_node, bg, gauge_node, gauge) = patched_animations(&sarc, arc, extra_colors)?;
-        (bg_node, bg, gauge_node, gauge, sarc.data_offset)
+        let (node, file) = patched_bg(&sarc, arc, extra_colors)?;
+        (node, file, sarc.data_offset)
     };
-    let mut len = size;
-    for (node, file) in [(bg_node, bg), (gauge_node, gauge)] {
-        let start = (len + 0x7f) & !0x7f;
-        if start + file.len() > buffer.len() {
-            return None;
-        }
-        buffer[len..start].fill(0);
-        buffer[start..start + file.len()].copy_from_slice(&file);
-        len = start + file.len();
-        put_u32(buffer, node + 8, start - data_offset);
-        put_u32(buffer, node + 12, len - data_offset);
+    let start = (size + 0x7f) & !0x7f;
+    if start + file.len() > buffer.len() {
+        return None;
     }
+    buffer[size..start].fill(0);
+    buffer[start..start + file.len()].copy_from_slice(&file);
+    let len = start + file.len();
+    put_u32(buffer, node + 8, start - data_offset);
+    put_u32(buffer, node + 12, len - data_offset);
     put_u32(buffer, 8, len);
     Some(len)
 }
 
-fn patched_animations(sarc: &Sarc, arc: &[u8], extra_colors: &[[f32; 3]]) -> Option<(usize, Vec<u8>, usize, Vec<u8>)> {
-    let (bg_node, bg_start, bg_end) = sarc.find(JACK_BG)?;
-    let (gauge_node, gauge_start, gauge_end) = sarc.find(JACK_GAUGE_COLOR)?;
-
-    let bg = rebuild_bflan(&arc[bg_start..bg_end], |contents| {
+fn patched_bg(sarc: &Sarc, arc: &[u8], extra_colors: &[[f32; 3]]) -> Option<(usize, Vec<u8>)> {
+    let (node, start, end) = sarc.find(JACK_BG)?;
+    let bg = rebuild_bflan(&arc[start..end], |contents| {
         append_frames(contents, |target, _| {
             extra_colors.iter().map(|c| c.get((target as usize).wrapping_sub(4)).copied().unwrap_or(255.0)).collect()
         })
     })?;
-    let gauge = rebuild_bflan(&arc[gauge_start..gauge_end], |contents| {
-        // Its frame 1 (used for every non-P5 color) is padded up to frame 2 so that
-        // frame 2 keeps meaning P4, then repeated for each extra color.
-        append_frames(contents, |_, keys| {
-            let non_p5 = value_at(keys, 1.0);
-            let last = keys.last().map(|k| k[0]).unwrap_or(0.0);
-            let pad = (2.0 - last).max(0.0) as usize;
-            std::iter::repeat(non_p5).take(pad + extra_colors.len()).collect()
-        })
-    })?;
-    Some((bg_node, bg, gauge_node, gauge))
+    Some((node, bg))
 }
