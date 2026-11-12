@@ -24,7 +24,6 @@ sdcard/
 ├── atmosphere/contents/01006A800016E000/romfs/skyline/plugins/libpersona_joker_colors.nro
 └── ultimate/persona_joker_colors/
     ├── config.txt
-    └── sky/<color>/
 ```
 
 ## Configuration (`ultimate/persona_joker_colors/config.txt`)
@@ -92,7 +91,6 @@ This mod was developed with the assistance of **Claude** (Anthropic), used throu
 
 - Claude wrote the game code analysis (locating the Persona color functions, HUD, victory scene, and theme playback), the plugin code, the sky-generation script, and this documentation, following the author's instructions.
 - The author defined the mod's intended behavior, tested each version in-game, and reported the results using screenshots.
-- The sky textures are the original game textures with their colors changed using the script; they were not generated with AI image tools.
 
 ## Credits
 
