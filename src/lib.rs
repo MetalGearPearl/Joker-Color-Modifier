@@ -2,13 +2,16 @@
 //!
 //! Per-costume Persona look for Joker slots, configured in
 //! `sd:/ultimate/persona_joker_colors/config.txt` (see config.rs): rebellion effects,
-//! battle HUD gauge, victory bars/lines, victory sky and victory theme. Outside Mementos the
-//! configured color/theme is forced; on Mementos everything stays vanilla (song-based).
+//! battle HUD gauge, victory bars/lines, victory scene colors and victory theme. Outside Mementos the
+//! configured color/theme is forced; on Mementos everything follows the song: the vanilla
+//! P3/P4/P5 versions, or the extra P1/P2 IS/P2 EP/SMT versions (mementos.rs).
 //!
 //! Offsets are for Smash Ultimate 13.0.x (checked against 13.0.5).
 
 mod config;
 mod hud_patch;
+mod mementos;
+mod scene_grade;
 
 use config::{Color, Config, Source};
 use core::arch::aarch64::float32x4_t;
@@ -16,7 +19,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use skyline::hooks::{getRegionAddress, Region};
 
 /// Extra diagnostics in the emulator log (served files, forced colors and themes).
-const DEBUG_LOG: bool = false;
+pub(crate) const DEBUG_LOG: bool = false;
 
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
@@ -24,7 +27,7 @@ fn config() -> &'static Config {
     CONFIG.get_or_init(Config::load)
 }
 
-unsafe fn text_base() -> usize {
+pub(crate) unsafe fn text_base() -> usize {
     getRegionAddress(Region::Text) as usize
 }
 
@@ -112,6 +115,9 @@ fn applies(slot_config: &config::SlotConfig) -> bool {
 /// Configured color of a player (fighter kind read from the match info, which is reliable
 /// on the victory screen).
 fn entry_color(entry_id: i32) -> Option<&'static Color> {
+    if let Some(extra) = unsafe { winner_extra(entry_id) } {
+        return Some(&extra.color);
+    }
     entry_config(entry_id).filter(|c| applies(c))?.color.as_ref()
 }
 
@@ -119,7 +125,37 @@ fn entry_color(entry_id: i32) -> Option<&'static Color> {
 /// and HUD gauge), where the match info may not be filled in yet.
 fn joker_entry_color(entry_id: i32) -> Option<&'static Color> {
     let slot = unsafe { entry_slot(fighter_entry(entry_id)) }?;
-    config().slots.get(&(config::FIGHTER_KIND_JACK, slot)).filter(|c| applies(c))?.color.as_ref()
+    let slot_config = config().slots.get(&(config::FIGHTER_KIND_JACK, slot));
+    if let Some(slot_config) = slot_config.filter(|c| c.fixed) {
+        return slot_config.color.as_ref();
+    }
+    if let Some(extra) = mementos_extra() {
+        return Some(&extra.color);
+    }
+    slot_config.filter(|c| applies(c))?.color.as_ref()
+}
+
+/// Settings of the extra Mementos version (P1 / P2 IS / P2 EP / SMT) when on Mementos with
+/// one of its songs.
+fn mementos_extra() -> Option<&'static mementos::ExtraConfig> {
+    if !on_mementos() {
+        return None;
+    }
+    config().mementos.get(&mementos::current()?)
+}
+
+/// After a Mementos battle with an extra version, the winner follows it when it is Joker or a
+/// configured fighter (using Joker's victory scene through CSK's result.stage) without `fixed`.
+unsafe fn winner_extra(winner: i32) -> Option<&'static mementos::ExtraConfig> {
+    let slot_config = entry_config(winner);
+    if slot_config.map_or(false, |c| c.fixed) {
+        return None;
+    }
+    let is_joker = entry_kind(winner) == Some(config::FIGHTER_KIND_JACK);
+    if !is_joker && slot_config.is_none() {
+        return None;
+    }
+    mementos_extra()
 }
 
 unsafe fn winner_entry() -> Option<i32> {
@@ -141,9 +177,37 @@ static LAST_MEMENTOS_VARIANT: AtomicUsize = AtomicUsize::new(2);
 
 #[skyline::hook(offset = MEMENTOS_VARIANT_OFFSET)]
 unsafe fn mementos_variant(stage_kind: u32, bgm: u64) -> u32 {
-    let variant = original!()(stage_kind, bgm);
+    let original = original!()(stage_kind, bgm);
+    let variant = match stage_kind {
+        0x148..=0x14a => mementos::pick(bgm).unwrap_or(original),
+        _ => original,
+    };
     LAST_MEMENTOS_VARIANT.store(variant as usize, Ordering::Relaxed);
     variant
+}
+
+/// Converts a song's special_category hash to the game's category kind (0xE/0xF/0x10 for
+/// the P5/P4/P3 Mementos songs).
+const CATEGORY_KIND_OFFSET: usize = 0x3255e10;
+const CATEGORY_KIND_PROLOGUE: [u8; 16] = [
+    0xe8, 0x03, 0x00, 0xaa, 0x69, 0x69, 0x94, 0xd2, 0x89, 0x36, 0xaf, 0xf2, 0x08, 0x9d, 0x40, 0x92,
+];
+
+#[skyline::hook(offset = CATEGORY_KIND_OFFSET)]
+unsafe fn category_kind(hash: u64) -> u32 {
+    original!()(mementos::vanilla_category(hash))
+}
+
+/// Looks up the stream set of a song for a stage: (bgm db, ui_bgm_id, ui_stage_id).
+const SONG_FOR_STAGE_OFFSET: usize = 0x325c7c0;
+const SONG_FOR_STAGE_PROLOGUE: [u8; 16] = [
+    0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91,
+];
+
+#[skyline::hook(offset = SONG_FOR_STAGE_OFFSET)]
+unsafe fn song_for_stage(db: *const u8, bgm: u64, stage: u64) -> u64 {
+    mementos::note_song(bgm);
+    original!()(db, bgm, stage)
 }
 
 // ---------------------------------------------------------------- Persona color function
@@ -256,69 +320,139 @@ unsafe fn jack_result_stage_setup(state: *mut u8) {
     }
 }
 
-// ---------------------------------------------------------------- victory sky
+// ---------------------------------------------------------------- victory scene
 
-/// The red of the victory sky is the sunset painted in these textures. Colorized copies
-/// (same size and BC3 sRGB format) live under sky/<color>/ on the SD card.
-const RESULT_SKY_DIR: &str = "stage/resultstage_jack/normal/model/resultstage_skydome_set";
-const RESULT_SKY_TEXTURES: [&str; 5] = [
-    "result_jack_sky01_col",
-    "result_jack_skycloud01_col",
-    "result_cloud01_col",
-    "result_cloud02_col",
-    "result_cloud03_col",
-];
-const SKY_ROOT: &str = "sd:/ultimate/persona_joker_colors/sky";
-/// Largest texture (8192x2048 BC3 with mips); every tinted copy keeps the vanilla size.
-const SKY_MAX_SIZE: usize = 22_374_064;
-
-fn sky_texture_for_hash(hash: u64) -> Option<&'static str> {
-    RESULT_SKY_TEXTURES
-        .iter()
-        .copied()
-        .find(|name| arcropolis_api::hash40(&format!("{}/{}.nutexb", RESULT_SKY_DIR, name)).as_u64() == hash)
+/// Look of the winner's victory scene, if it differs from what the song would pick.
+enum SceneLook {
+    /// One of the game's own scene versions, as a song category kind (0x10 P3, 0xF P4, 0xE P5).
+    Vanilla(u32),
+    /// The P3 version with its color grades pointed at this color (scene_grade).
+    Tinted(&'static Color),
 }
 
-/// Sky folder for the winner. Outside Mementos (or with `fixed`): its configured color.
-/// After a Mementos battle, configured non-Joker fighters (using Joker's victory scene
-/// through CSK's result.stage) follow the Mementos version; Joker himself is handled by
-/// the game.
-unsafe fn winner_sky() -> Option<&'static str> {
+const CATEGORY_KIND_P3: u32 = 0x10;
+const CATEGORY_KIND_P4: u32 = 0xf;
+const CATEGORY_KIND_P5: u32 = 0xe;
+
+fn scene_look(color: &'static Color) -> SceneLook {
+    match color.effect {
+        Source::Table(9) => SceneLook::Vanilla(CATEGORY_KIND_P3),
+        Source::Table(10) => SceneLook::Vanilla(CATEGORY_KIND_P4),
+        Source::Table(_) => SceneLook::Vanilla(CATEGORY_KIND_P5),
+        Source::Custom(_) => SceneLook::Tinted(color),
+    }
+}
+
+/// Outside Mementos (or with `fixed`): the winner's configured color. After a Mementos
+/// battle, configured non-Joker fighters (using Joker's victory scene through CSK's
+/// result.stage) follow the Mementos version; Joker himself is handled by the game.
+unsafe fn winner_scene() -> Option<SceneLook> {
     let winner = winner_entry()?;
+    if let Some(extra) = winner_extra(winner) {
+        return Some(scene_look(&extra.color));
+    }
     let slot_config = entry_config(winner)?;
     if applies(slot_config) {
-        return slot_config.color.as_ref()?.sky.as_deref();
+        return Some(scene_look(slot_config.color.as_ref()?));
     }
     let (kind, _) = entry_key(winner)?;
     if kind == config::FIGHTER_KIND_JACK {
         return None;
     }
-    match LAST_MEMENTOS_VARIANT.load(Ordering::Relaxed) {
-        0 => Some("blue"),
-        1 => Some("yellow"),
+    Some(SceneLook::Vanilla(match LAST_MEMENTOS_VARIANT.load(Ordering::Relaxed) {
+        0 => CATEGORY_KIND_P3,
+        1 => CATEGORY_KIND_P4,
+        _ => CATEGORY_KIND_P5,
+    }))
+}
+
+/// Constructor of the result screen scene. The match info's +0x1C578 holds the P3/P4/P5
+/// song of a Mementos match (set when the match starts, 0 elsewhere), and the victory scene
+/// (sky and ground lighting, fighter light, bars, Joker's jingle) uses its version; without
+/// one it is the plain P5 scene. The winner's version is written there before the scene
+/// reads it.
+const RESULT_SCENE_CTOR_OFFSET: usize = 0x143f930;
+const RESULT_SCENE_CTOR_PROLOGUE: [u8; 16] = [
+    0xff, 0x83, 0x05, 0xd1, 0xfc, 0x6f, 0x10, 0xa9, 0xfa, 0x67, 0x11, 0xa9, 0xf8, 0x5f, 0x12, 0xa9,
+];
+const RESULT_PERSONA_SONG: usize = 0x1c578;
+/// Type byte of a ui_bgm_id value.
+const BGM_ID_TAG: u64 = 0xd9 << 56;
+
+#[skyline::hook(offset = RESULT_SCENE_CTOR_OFFSET)]
+unsafe fn result_scene_ctor(this: *mut u8) {
+    set_result_persona_song();
+    original!()(this)
+}
+
+unsafe fn set_result_persona_song() {
+    // The scene is built when a match ends (before the game enters result mode); only then
+    // is there a winner to ask for.
+    if !BATTLE_RUNNING.swap(false, Ordering::Relaxed) {
+        if DEBUG_LOG {
+            println!("[persona_joker_colors] victory scene: no match result yet");
+        }
+        return;
+    }
+    // Custom colors use the P3 scene with its color grades rewritten (scene_grade).
+    let scene = winner_scene();
+    scene_grade::set_current(match scene {
+        Some(SceneLook::Tinted(color)) => Some(color),
         _ => None,
+    });
+    let kind = match scene {
+        Some(SceneLook::Vanilla(kind)) => kind,
+        Some(SceneLook::Tinted(_)) => CATEGORY_KIND_P3,
+        None => return,
+    };
+    let Some(song) = mementos::persona_song((kind - CATEGORY_KIND_P5) as usize) else {
+        return;
+    };
+    let song = BGM_ID_TAG | song;
+    let result_info: extern "C" fn() -> *mut u8 = core::mem::transmute(text_base() + RESULT_INFO_OFFSET);
+    let info = result_info();
+    if info.is_null() {
+        return;
+    }
+    *(info.add(RESULT_PERSONA_SONG) as *mut u64) = song;
+    if DEBUG_LOG {
+        println!("[persona_joker_colors] victory scene song {:#x}", song);
     }
 }
 
-extern "C" fn result_sky_callback(hash: u64, out: *mut u8, length: usize, out_size: &mut usize) -> bool {
-    let Some(folder) = (unsafe { winner_sky() }) else {
-        return false;
+// ---------------------------------------------------------------- victory lines
+
+/// The "DNA" tubes behind the winner (Blood_vessel material). Only vanilla Joker costumes
+/// keep them: the model is served with no mesh entries for everyone else.
+const RESULT_LINES_MODEL: &str = "stage/resultstage_jack/normal/model/resultstage_effect_set/model.numdlb";
+const RESULT_LINES_MODEL_SIZE: usize = 0x1000;
+/// MODL (SSBH) entry list: relative offset at 0x48, count at 0x50.
+const MODL_ENTRY_COUNT: usize = 0x50;
+const VANILLA_JOKER_SLOTS: u8 = 8;
+
+unsafe fn winner_keeps_lines() -> bool {
+    let Some((kind, slot)) = winner_entry().and_then(|w| entry_key(w)) else {
+        return true;
     };
-    let Some(name) = sky_texture_for_hash(hash) else {
-        return false;
-    };
-    let path = format!("{}/{}/{}.nutexb", SKY_ROOT, folder, name);
-    let Ok(data) = std::fs::read(&path) else {
-        println!("[persona_joker_colors] missing {} (run generar_cielos.py)", path);
-        return false;
-    };
-    if data.len() > length {
+    kind == config::FIGHTER_KIND_JACK && slot < VANILLA_JOKER_SLOTS
+}
+
+extern "C" fn result_lines_callback(hash: u64, out: *mut u8, length: usize, out_size: &mut usize) -> bool {
+    if unsafe { winner_keeps_lines() } {
         return false;
     }
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len()) };
-    *out_size = data.len();
+    let buffer = unsafe { core::slice::from_raw_parts_mut(out, length) };
+    let Some(size) = arcropolis_api::load_original_file(hash, &mut *buffer) else {
+        return false;
+    };
+    if size < MODL_ENTRY_COUNT + 8 || &buffer[..4] != b"HBSS" || &buffer[0x10..0x14] != b"LDOM" {
+        println!("[persona_joker_colors] victory lines model not patched (unexpected format)");
+        return false;
+    }
+    buffer[MODL_ENTRY_COUNT..MODL_ENTRY_COUNT + 8].fill(0);
+    *out_size = size;
     if DEBUG_LOG {
-        println!("[persona_joker_colors] served {}", path);
+        println!("[persona_joker_colors] victory lines hidden");
     }
     true
 }
@@ -326,8 +460,10 @@ extern "C" fn result_sky_callback(hash: u64, out: *mut u8, length: usize, out_si
 // ---------------------------------------------------------------- battle HUD
 
 /// Battle HUD (info_melee). One 0xD90-byte block per player is constructed by HUD_CTOR; the
-/// Joker animation holders jack_bg / jack_guage_color live inside it. Their frames pick the
-/// color: 0 = P5 red, 1 = P3 blue, 2 = P4 yellow, 3.. = colors added by hud_patch.
+/// Joker animation holder jack_bg (gauge outline and portrait backdrop) lives inside it. Its
+/// frame picks the color: 0 = P5 red, 1 = P3 blue, 2 = P4 yellow, 3.. = colors added by
+/// hud_patch. The gauge fill (jack_guage_color: 0 = purple, 1 = aqua while the Persona is
+/// out) is left to the game.
 const HUD_CTOR_OFFSET: usize = 0x1b635a0;
 const HUD_CTOR_PROLOGUE: [u8; 16] = [
     0xff, 0x83, 0x01, 0xd1, 0xf9, 0x0b, 0x00, 0xf9, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9,
@@ -338,12 +474,13 @@ const ANIM_SET_FRAME_PROLOGUE: [u8; 16] = [
     0xe8, 0x0f, 0x1c, 0xfc, 0xf6, 0x57, 0x01, 0xa9, 0xf4, 0x4f, 0x02, 0xa9, 0xfd, 0x7b, 0x03, 0xa9,
 ];
 const HUD_PLAYER_STRIDE: usize = 0xd90;
-/// The HUD layout code addresses them as hud + 0xED0 / 0xEE0, and the player blocks start
-/// at hud + 0x200, so relative to each player block they are at +0xCD0 / +0xCE0.
+/// The HUD layout code addresses it as hud + 0xED0, and the player blocks start at
+/// hud + 0x200, so relative to each player block it is at +0xCD0.
 const HUD_JACK_BG_HOLDER: usize = 0xcd0;
-const HUD_JACK_GAUGE_COLOR_HOLDER: usize = 0xce0;
 
 static HUD_THIS: AtomicUsize = AtomicUsize::new(0);
+/// Set when a match's HUD is built, cleared when its result scene is.
+static BATTLE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// The constructor runs once per player block (8 contiguous blocks, 0xD90 apart);
 /// HUD_THIS keeps the first block of the current series, i.e. player 0.
@@ -358,11 +495,12 @@ unsafe fn hud_ctor(this: *mut u8, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a
         && (block - base) / HUD_PLAYER_STRIDE < 8;
     if !continues_series {
         HUD_THIS.store(block, Ordering::Relaxed);
+        BATTLE_RUNNING.store(true, Ordering::Relaxed);
         LAST_BATTLE_ON_MEMENTOS.store(stage_is_mementos(), Ordering::Relaxed);
     }
 }
 
-/// If `holder` is a Joker color animation of a configured player's HUD block, its frame.
+/// If `holder` is the jack_bg animation of a configured player's HUD block, its frame.
 unsafe fn forced_hud_frame(holder: *const u8) -> Option<f32> {
     let hud = HUD_THIS.load(Ordering::Relaxed);
     let holder = holder as usize;
@@ -371,7 +509,7 @@ unsafe fn forced_hud_frame(holder: *const u8) -> Option<f32> {
     }
     let rel = holder - hud;
     let player = rel / HUD_PLAYER_STRIDE;
-    if player >= 8 || !matches!(rel - player * HUD_PLAYER_STRIDE, HUD_JACK_BG_HOLDER | HUD_JACK_GAUGE_COLOR_HOLDER) {
+    if player >= 8 || rel - player * HUD_PLAYER_STRIDE != HUD_JACK_BG_HOLDER {
         return None;
     }
     config().hud_frame(joker_entry_color(player as i32)?)
@@ -433,6 +571,16 @@ unsafe fn music_play(player: *mut u64, param_2: i64, nus3bank_hash: u64, nus3aud
     let mut index = index;
     let joker_jingle = !audio.is_null() && JOKER_JINGLES.iter().any(|j| stream_hash(j, "nus3audio") == *audio);
     let winner = if joker_jingle { winner_entry() } else { None };
+    if let Some(extra) = winner.and_then(|w| winner_extra(w)) {
+        FORCED_AUDIO_HASH = stream_hash(&extra.theme, "nus3audio");
+        if DEBUG_LOG {
+            println!("[persona_joker_colors] jingle {:#x} -> {} (Mementos)", *audio, extra.theme);
+        }
+        if JOKER_JINGLES.iter().any(|j| stream_hash(j, "nus3bank") == nus3bank_hash) {
+            bank = stream_hash(&extra.theme, "nus3bank");
+        }
+        return original!()(player, param_2, bank, core::ptr::addr_of!(FORCED_AUDIO_HASH), 0);
+    }
     let slot_config = winner.and_then(entry_config);
     if let (Some(winner), Some(slot_config)) = (winner, slot_config) {
         if !applies(slot_config) && entry_key(winner).map_or(false, |(kind, _)| kind != config::FIGHTER_KIND_JACK) {
@@ -474,6 +622,10 @@ pub fn main() {
             || !code_matches(ANIM_SET_FRAME_OFFSET, &ANIM_SET_FRAME_PROLOGUE)
             || !code_matches(MUSIC_PLAY_OFFSET, &MUSIC_PLAY_PROLOGUE)
             || !code_matches(MEMENTOS_VARIANT_OFFSET, &MEMENTOS_VARIANT_PROLOGUE)
+            || !code_matches(CATEGORY_KIND_OFFSET, &CATEGORY_KIND_PROLOGUE)
+            || !code_matches(SONG_FOR_STAGE_OFFSET, &SONG_FOR_STAGE_PROLOGUE)
+            || !code_matches(RESULT_SCENE_CTOR_OFFSET, &RESULT_SCENE_CTOR_PROLOGUE)
+            || !code_matches(scene_grade::READ_GRADE_OFFSET, &scene_grade::READ_GRADE_PROLOGUE)
         {
             println!("[persona_joker_colors] Unsupported game version, not installing.");
             return;
@@ -484,14 +636,13 @@ pub fn main() {
         config().slots.len(),
         config().extra_hud_colors.len()
     );
-    skyline::install_hooks!(get_player_color, jack_result_stage_setup, hud_ctor, anim_set_frame, music_play, mementos_variant);
-    for name in RESULT_SKY_TEXTURES {
-        arcropolis_api::register_callback(
-            arcropolis_api::hash40(&format!("{}/{}.nutexb", RESULT_SKY_DIR, name)),
-            SKY_MAX_SIZE,
-            result_sky_callback,
-        );
-    }
+    skyline::install_hooks!(get_player_color, jack_result_stage_setup, hud_ctor, anim_set_frame, music_play, mementos_variant, category_kind, song_for_stage, result_scene_ctor, scene_grade::read_grade);
+    mementos::register_stage_files();
+    arcropolis_api::register_callback(
+        arcropolis_api::hash40(RESULT_LINES_MODEL),
+        RESULT_LINES_MODEL_SIZE,
+        result_lines_callback,
+    );
     if !config().extra_hud_colors.is_empty() {
         arcropolis_api::register_callback(arcropolis_api::hash40(hud_patch::HUD_LAYOUT), HUD_LAYOUT_BUFFER, hud_layout_callback);
     }
