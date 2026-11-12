@@ -7,7 +7,12 @@
 //! `color` is a name from the palette below or `#RRGGBB`; both keys are optional.
 //! A trailing `fixed` keeps the color and theme on Mementos too.
 //! Lines starting with `#` are comments. Slots without a line keep vanilla behavior.
+//!
+//! The extra Mementos versions (see mementos.rs) are configured the same way:
+//!     mementos p1, color: purple, theme: bgm_z97d_f_jack_p1
+//! with `p1`, `p2is`, `p2ep` or `smt`; versions without a line use their defaults.
 
+use crate::mementos::{self, Extra, ExtraConfig};
 use std::collections::HashMap;
 
 pub const CONFIG_PATH: &str = "sd:/ultimate/persona_joker_colors/config.txt";
@@ -22,8 +27,6 @@ pub enum Source {
 
 #[derive(Clone, Debug)]
 pub struct Color {
-    /// Name used for the sky texture folder (`sky/<name>`).
-    pub sky: Option<String>,
     pub effect: Source,
     /// HUD jack_bg color, 0..255.
     pub hud: [f32; 3],
@@ -32,16 +35,15 @@ pub struct Color {
 }
 
 fn named(name: &str) -> Option<Color> {
-    let custom = |sky: &str, effect: [f32; 3], hud: [f32; 3]| Color {
-        sky: Some(sky.to_string()),
+    let custom = |_name: &str, effect: [f32; 3], hud: [f32; 3]| Color {
         effect: Source::Custom(effect),
         hud,
         hud_frame: None,
     };
     Some(match name {
-        "red" => Color { sky: Some("red".into()), effect: Source::Table(11), hud: [255.0, 0.0, 0.0], hud_frame: Some(0.0) },
-        "blue" => Color { sky: Some("blue".into()), effect: Source::Table(9), hud: [0.0, 42.6, 255.0], hud_frame: Some(1.0) },
-        "yellow" => Color { sky: Some("yellow".into()), effect: Source::Table(10), hud: [223.2, 149.4, 4.3], hud_frame: Some(2.0) },
+        "red" => Color { effect: Source::Table(11), hud: [255.0, 0.0, 0.0], hud_frame: Some(0.0) },
+        "blue" => Color { effect: Source::Table(9), hud: [0.0, 42.6, 255.0], hud_frame: Some(1.0) },
+        "yellow" => Color { effect: Source::Table(10), hud: [223.2, 149.4, 4.3], hud_frame: Some(2.0) },
         "green" => custom("green", [0.05, 0.8, 0.1], [20.0, 200.0, 40.0]),
         "pink" => custom("pink", [1.0, 0.3, 0.6], [255.0, 80.0, 170.0]),
         "purple" => custom("purple", [0.55, 0.15, 1.0], [140.0, 40.0, 255.0]),
@@ -60,7 +62,6 @@ fn hex(value: &str) -> Option<Color> {
     let channel = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
     let rgb = [channel(0)?, channel(2)?, channel(4)?];
     Some(Color {
-        sky: Some(format!("hex_{}", digits.to_ascii_lowercase())),
         effect: Source::Custom(rgb.map(|c| c as f32 / 255.0)),
         hud: rgb.map(|c| c as f32),
         hud_frame: None,
@@ -112,6 +113,26 @@ pub struct Config {
     pub slots: HashMap<(u32, u8), SlotConfig>,
     /// Colors that need an added HUD frame, in frame order (frame = 3 + index).
     pub extra_hud_colors: Vec<[f32; 3]>,
+    /// Color and victory theme of each extra Mementos version.
+    pub mementos: HashMap<Extra, ExtraConfig>,
+}
+
+fn parse_color(value: &str) -> Option<Color> {
+    let lower = value.to_ascii_lowercase();
+    named(&lower).or_else(|| hex(&lower))
+}
+
+fn theme_name(value: &str) -> String {
+    let name = value.trim_end_matches(".nus3audio");
+    if name.starts_with("bgm_") { name.to_string() } else { format!("bgm_{}", name) }
+}
+
+impl Config {
+    fn add_hud_color(&mut self, color: &Color) {
+        if color.hud_frame.is_none() && !self.extra_hud_colors.contains(&color.hud) {
+            self.extra_hud_colors.push(color.hud);
+        }
+    }
 }
 
 fn parse_slot(token: &str) -> Option<u8> {
@@ -134,6 +155,25 @@ pub fn parse(text: &str) -> Config {
         }
         let mut fields = line.split(',').map(str::trim).filter(|f| !f.is_empty());
         let head = fields.next().unwrap_or_default();
+        if let Some(("mementos", version)) = head.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())) {
+            let Some(extra) = Extra::from_config_name(&version.to_ascii_lowercase()) else {
+                println!("[persona_joker_colors] config line {}: unknown Mementos version '{}'", number + 1, version);
+                continue;
+            };
+            let mut extra_config = default_extra(extra);
+            for field in fields {
+                match field.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim())) {
+                    Some((key, value)) if key == "color" => match parse_color(value) {
+                        Some(color) => extra_config.color = color,
+                        None => println!("[persona_joker_colors] config line {}: unknown color '{}'", number + 1, value),
+                    },
+                    Some((key, value)) if key == "theme" => extra_config.theme = theme_name(value),
+                    _ => println!("[persona_joker_colors] config line {}: unknown option '{}'", number + 1, field),
+                }
+            }
+            config.mementos.insert(extra, extra_config);
+            continue;
+        }
         let (kind, slot_token) = match head.split_once(char::is_whitespace) {
             Some((fighter, slots)) => match fighter_kind(&fighter.to_ascii_lowercase()) {
                 Some(kind) => (kind, slots.trim()),
@@ -160,30 +200,31 @@ pub fn parse(text: &str) -> Config {
             let value = value.trim();
             match key.trim().to_ascii_lowercase().as_str() {
                 "color" => {
-                    let lower = value.to_ascii_lowercase();
-                    slot_config.color = named(&lower).or_else(|| hex(&lower));
+                    slot_config.color = parse_color(value);
                     if slot_config.color.is_none() {
                         println!("[persona_joker_colors] config line {}: unknown color '{}'", number + 1, value);
                     }
                 }
-                "theme" => {
-                    let name = value.trim_end_matches(".nus3audio");
-                    let name = if name.starts_with("bgm_") { name.to_string() } else { format!("bgm_{}", name) };
-                    slot_config.theme = Some(name);
-                }
+                "theme" => slot_config.theme = Some(theme_name(value)),
                 other => println!("[persona_joker_colors] config line {}: unknown key '{}'", number + 1, other),
             }
         }
         if let Some(color) = &slot_config.color {
-            if color.hud_frame.is_none() && !config.extra_hud_colors.contains(&color.hud) {
-                config.extra_hud_colors.push(color.hud);
-            }
+            config.add_hud_color(color);
         }
         for slot in slots {
             config.slots.insert((kind, slot), slot_config.clone());
         }
     }
+    for extra in mementos::ALL {
+        let extra_config = config.mementos.entry(extra).or_insert_with(|| default_extra(extra)).clone();
+        config.add_hud_color(&extra_config.color);
+    }
     config
+}
+
+fn default_extra(extra: Extra) -> ExtraConfig {
+    ExtraConfig { color: parse_color(extra.default_color()).unwrap(), theme: extra.default_theme().to_string() }
 }
 
 impl Config {
@@ -191,8 +232,8 @@ impl Config {
         match std::fs::read_to_string(CONFIG_PATH) {
             Ok(text) => parse(&text),
             Err(_) => {
-                println!("[persona_joker_colors] no {}, nothing to do", CONFIG_PATH);
-                Config::default()
+                println!("[persona_joker_colors] no {}, using defaults", CONFIG_PATH);
+                parse("")
             }
         }
     }
